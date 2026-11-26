@@ -1,0 +1,36 @@
+name: Tracker API Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: API Test
+        env:
+          TRACKER_API_KEY: ${{ secrets.TRACKER_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.request
+
+          key = os.environ["TRACKER_API_KEY"]
+
+          req = urllib.request.Request(
+              "https://api.lastasylumtracker.com/v1/quota",
+              headers={
+                  "Authorization": "Bearer " + key,
+                  "User-Agent": "LastBattle/1.0"
+              }
+          )
+
+          with urllib.request.urlopen(req) as res:
+              data = json.load(res)
+              print("API CONNECTION SUCCESS")
+              print(json.dumps(data, indent=2))
+          PY
