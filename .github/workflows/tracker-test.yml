@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Hero Power Test
+      - name: Last Login Test
         env:
           TRACKER_API_KEY: ${{ secrets.TRACKER_API_KEY }}
         run: |
@@ -20,23 +20,64 @@ jobs:
           import urllib.request
           import urllib.parse
 
-          name = urllib.parse.quote("두부상")
-          url = f"https://api.lastasylumtracker.com/v1/players/252/{name}?fresh=1"
+          targets = [
+              (225, "Crit"),
+              (252, "요즘사람"),
+              (252, "CROW."),
+              (256, "EMAF")
+          ]
 
-          req = urllib.request.Request(
-              url,
-              headers={
-                  "Authorization": "Bearer " + os.environ["TRACKER_API_KEY"],
-                  "User-Agent": "LastBattle/1.0"
-              }
-          )
+          def get(path):
+              req = urllib.request.Request(
+                  "https://api.lastasylumtracker.com/v1/" + path,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["TRACKER_API_KEY"],
+                      "User-Agent": "LastBattle/1.0"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=60) as res:
+                  return json.load(res)
 
-          with urllib.request.urlopen(req, timeout=60) as res:
-              data = json.load(res)
+          def find_members(obj):
+              if isinstance(obj, dict):
+                  if isinstance(obj.get("members"), list):
+                      return obj["members"]
+                  for value in obj.values():
+                      found = find_members(value)
+                      if found is not None:
+                          return found
+              return None
 
-          heroes = data.get("ranks", {}).get("heroes", {})
-          print("HERO POWER:", heroes.get("score"))
-          print("HERO RANK:", heroes.get("rank"))
-          print("TOTAL POWER:", data.get("power"))
-          print("DATA AGE:", data.get("age_seconds"))
+          def check(data):
+              members = find_members(data)
+              if not members:
+                  print("NO MEMBERS")
+                  return
+
+              print("MEMBERS:", len(members))
+              print("DATA AGE:", data.get("age_seconds"))
+
+              for field in ["online", "last_online_at",
+                            "joined_at", "active"]:
+                  count = sum(
+                      m.get(field) is not None
+                      for m in members
+                  )
+                  print(field, count, "/", len(members))
+
+              states = {}
+              for m in members:
+                  value = str(m.get("online"))
+                  states[value] = states.get(value, 0) + 1
+              print("ONLINE STATES:", states)
+
+          for server, tag in targets:
+              path = f"alliances/{server}/{urllib.parse.quote(tag)}"
+
+              for fresh in [False, True]:
+                  print("---", server, tag, "FRESH:", fresh)
+                  try:
+                      check(get(path + ("?fresh=1" if fresh else "")))
+                  except Exception as e:
+                      print("ERROR:", type(e).__name__)
           PY
