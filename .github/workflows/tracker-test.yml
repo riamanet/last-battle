@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Alliance Test
+      - name: Check Available Data
         env:
           TRACKER_API_KEY: ${{ secrets.TRACKER_API_KEY }}
         run: |
@@ -21,19 +21,18 @@ jobs:
           import urllib.parse
 
           key = os.environ["TRACKER_API_KEY"]
-          tag = urllib.parse.quote("요즘사람")
-          url = f"https://api.lastasylumtracker.com/v1/alliances/252/{tag}?fresh=1"
+          base = "https://api.lastasylumtracker.com/v1/"
 
-          req = urllib.request.Request(
-              url,
-              headers={
-                  "Authorization": "Bearer " + key,
-                  "User-Agent": "LastBattle/1.0"
-              }
-          )
-
-          with urllib.request.urlopen(req, timeout=60) as res:
-              data = json.load(res)
+          def get(path):
+              req = urllib.request.Request(
+                  base + path,
+                  headers={
+                      "Authorization": "Bearer " + key,
+                      "User-Agent": "LastBattle/1.0"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=60) as res:
+                  return json.load(res)
 
           def find_members(obj):
               if isinstance(obj, dict):
@@ -45,15 +44,34 @@ jobs:
                           return found
               return None
 
+          tag = urllib.parse.quote("요즘사람")
+          data = get(f"alliances/252/{tag}?fresh=1")
           members = find_members(data)
-          if members is None:
+
+          if not members:
               raise RuntimeError("Roster not found")
 
-          print("ALLIANCE CONNECTION SUCCESS")
-          print("Members:", len(members))
+          print("MEMBERS:", len(members))
+          print("ALL AVAILABLE MEMBER FIELDS")
 
-          for field in ["uid", "name", "power", "online",
-                        "last_online_at", "active"]:
+          fields = sorted(set().union(*(m.keys() for m in members)))
+
+          for field in fields:
               count = sum(m.get(field) is not None for m in members)
-              print(field, ":", count)
+              print(f"{field}: {count}/{len(members)}")
+
+          print("PLAYER PROFILE FIELDS")
+
+          uid = members[0]["uid"]
+          profile = get(f"players/{uid}?fresh=1")
+
+          def inspect(obj, prefix=""):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      path = prefix + k
+                      print(path, type(v).__name__)
+                      if isinstance(v, dict):
+                          inspect(v, path + ".")
+
+          inspect(profile)
           PY
