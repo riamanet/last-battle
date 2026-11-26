@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: API Test
+      - name: Alliance Test
         env:
           TRACKER_API_KEY: ${{ secrets.TRACKER_API_KEY }}
         run: |
@@ -18,19 +18,42 @@ jobs:
           import os
           import json
           import urllib.request
+          import urllib.parse
 
           key = os.environ["TRACKER_API_KEY"]
+          tag = urllib.parse.quote("요즘사람")
+          url = f"https://api.lastasylumtracker.com/v1/alliances/252/{tag}?fresh=1"
 
           req = urllib.request.Request(
-              "https://api.lastasylumtracker.com/v1/quota",
+              url,
               headers={
                   "Authorization": "Bearer " + key,
                   "User-Agent": "LastBattle/1.0"
               }
           )
 
-          with urllib.request.urlopen(req) as res:
+          with urllib.request.urlopen(req, timeout=60) as res:
               data = json.load(res)
-              print("API CONNECTION SUCCESS")
-              print(json.dumps(data, indent=2))
+
+          def find_members(obj):
+              if isinstance(obj, dict):
+                  if isinstance(obj.get("members"), list):
+                      return obj["members"]
+                  for value in obj.values():
+                      found = find_members(value)
+                      if found is not None:
+                          return found
+              return None
+
+          members = find_members(data)
+          if members is None:
+              raise RuntimeError("Roster not found")
+
+          print("ALLIANCE CONNECTION SUCCESS")
+          print("Members:", len(members))
+
+          for field in ["uid", "name", "power", "online",
+                        "last_online_at", "active"]:
+              count = sum(m.get(field) is not None for m in members)
+              print(field, ":", count)
           PY
