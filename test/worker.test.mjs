@@ -92,7 +92,9 @@ function world() {
           : [...w.players.values()].find((x) => x.kid === Number(parts[1]) && x.nick_name === parts[2]);
       if (!p) return json(404, { ok: false });
       const { heroes, ...rest } = p;
-      return json(200, { ok: true, ...rest, ranks: { heroes: { score: heroes, rank: 1 } }, age_seconds: w.age, cached: w.age > 0 });
+      // 실제 응답과 같은 모양: 점수는 문자열, heroes가 아예 없는 유저도 있다.
+      const ranks = { power: { rank: 1, score: String(rest.power) }, ...(heroes == null ? {} : { heroes: { rank: 1, score: String(heroes) } }) };
+      return json(200, { ok: true, player_id: rest.uid, nick: rest.nick_name, sid: rest.kid, ...rest, ranks, alliance_members: [], age_seconds: w.age, cached: w.age > 0, refreshing: false });
     }
     const members = w.guilds.get(parts[1] + "/" + parts[2]);
     if (!members) return json(404, { ok: false });
@@ -111,7 +113,7 @@ function seedServer(w, server, { guildSize = 25 } = {}) {
     if (guild) {
       const key = server + "/" + guild;
       if (!w.guilds.has(key)) w.guilds.set(key, []);
-      w.guilds.get(key).push({ uid: Number(uid), name: `P${server}_${i}`, power: 200_000_000 - i * 1000 });
+      w.guilds.get(key).push({ uid: Number(uid), nick_name: `P${server}_${i}`, kid: server, power: 200_000_000 - i * 1000, online: false, last_online_at: null });
     }
   }
   w.rankings.set(server, rows);
@@ -270,7 +272,7 @@ test("상위 100위 밖으로 밀려난 유저는 순위표에서 빠진다", as
   assert.equal(new Set(players.map((p) => p.rank)).size, 100);
 });
 
-test("자동 수집: 틱마다 랭킹 1개 서버 + 길드 4곳, 전체 투력 변동을 기록한다", async () => {
+test("자동 수집: 틱마다 랭킹 1개 서버를 읽고, 길드 전체 투력 변동을 기록한다", async () => {
   const { w, call, cron, sql } = await setup();
   seedServer(w, 225);
   const first = await cron();
@@ -315,19 +317,20 @@ test("자동 수집: 없는 길드는 간격을 늘려 재시도하고 다른 �
   assert.match(g.error, /찾지 못했습니다/);
 });
 
-test("하루 한도: 자동 수집은 320회에서 멈추고, 수동 조회는 자동 몫과 예비를 침범하지 않는다", async () => {
+test("하루 한도: 자동 수집은 550회에서 멈추고, 수동 조회는 자동 몫과 예비를 침범하지 않는다", async () => {
   const { w, call, cron, sql } = await setup();
   seedServer(w, 225);
   await call("load", { servers: [225] });
   const today = new Date(clock).toISOString().slice(0, 10);
 
   // 자동 수집 몫을 거의 다 쓴 상태
-  sql("INSERT INTO quota(day,lim,remaining,auto_used,manual_used) VALUES(?,1000,682,318,0)", today);
-  w.quota.remaining = 682;
+  sql("INSERT INTO quota(day,lim,remaining,auto_used,manual_used) VALUES(?,1000,452,548,0)", today);
+  w.quota.remaining = 452;
   const r = await cron();
   assert.equal(r.guildsOk, 2);
   assert.match(r.note, /자동 수집 한도/);
-  assert.equal(sql("SELECT auto_used FROM quota")[0].auto_used, 320);
+  assert.equal(sql("SELECT auto_used FROM quota")[0].auto_used, 550);
+  assert.equal(sql("SELECT remaining FROM quota")[0].remaining, 450); // Cron이 끝에 한 번 기록한 실제 잔여 횟수
 
   // 수동 조회는 예비 50회를 남기고 멈춘다. 동시에 눌러도 넘지 않는다.
   sql("UPDATE quota SET remaining=53");
@@ -338,11 +341,14 @@ test("하루 한도: 자동 수집은 320회에서 멈추고, 수동 조회는 �
   assert.equal(w.quota.remaining, 50);
   assert.equal((await call("load", {})).body.quota.manualLeft, 0);
 
-  // 자동 수집이 아직 안 돈 날에는 그 몫(320)까지 보호한다.
-  sql("UPDATE quota SET remaining=370,auto_used=0");
-  w.quota.remaining = 370;
+  // 자동 수집이 아직 안 돈 날에는 그 몫(550)까지 보호한다.
+  sql("UPDATE quota SET remaining=600,auto_used=0");
+  w.quota.remaining = 600;
   assert.equal((await call("refresh", { uid: "225000000" })).status, 429);
-  assert.equal(w.quota.remaining, 370);
+  assert.equal(w.quota.remaining, 600);
+  sql("UPDATE quota SET remaining=601");
+  w.quota.remaining = 601;
+  assert.equal((await call("refresh", { uid: "225000000" })).status, 200);
 
   // UTC 날짜가 바뀌면 다시 전체 한도에서 시작한다.
   advance(24 * HOUR);
@@ -368,6 +374,70 @@ test("기존 v4 DB(first_at 없음)를 그대로 이어 쓴다", async () => {
   assert.ok(sql("PRAGMA table_info(players)").some((c) => c.name === "first_at"));
   assert.equal(sql("SELECT COUNT(*) AS n FROM tracked")[0].n, 1); // 예전 테이블은 건드리지 않는다
   assert.equal(sql("SELECT COUNT(*) AS n FROM servers")[0].n, 32);
+});
+
+test("자동 수집: 한 틱에 길드는 6곳까지, 랭킹 인원이 많은 길드부터", async () => {
+  const { w, cron, sql } = await setup();
+  seedServer(w, 225, { guildSize: 12 }); // 길드 8곳
+  w.rankings.get(225)[95].guild = "G0"; // G0만 13명으로 가장 많다
+  w.guilds.get("225/G0").push({ uid: 225000095, nick_name: "P225_95", kid: 225, power: 1 });
+  assert.equal((await cron()).guildsOk, 6);
+  assert.equal(sql("SELECT COUNT(*) AS n FROM guilds WHERE fetched_at IS NULL")[0].n, 2);
+  assert.ok(sql("SELECT fetched_at FROM guilds WHERE tag='G0'")[0].fetched_at);
+  advance(HOUR / 4);
+  sql("UPDATE servers SET rank_at=?,rank_try_at=?", clock / 1000, clock / 1000);
+  assert.equal((await cron()).guildsOk, 2);
+});
+
+test("등록한 내 캐릭터가 랭킹 밖이면 하루 한 번 자동으로 갱신한다", async () => {
+  const { w, call, cron, sql } = await setup();
+  seedServer(w, 252);
+  w.players.set("999", { uid: 999, nick_name: "달콩쓰", kid: 252, alliance_abbr: "요즘사람", power: 150_000_000, heroes: 40_000_000 });
+  await call("register", { server: 252, nick: "P252_3" }); // 랭킹 안: 자동 갱신에 API를 쓰지 않는다
+  await call("register", { server: 252, nick: "달콩쓰" }); // 랭킹 밖: Tracker 1회
+  assert.equal(w.calls.tracker, 1);
+  sql("UPDATE guilds SET next_at=9999999999"); // 길드 수집은 이 테스트에서 제외
+
+  advance(HOUR);
+  assert.equal((await cron()).mine, undefined); // 하루가 지나기 전에는 다시 읽지 않는다
+  advance(24 * HOUR);
+  w.players.get("999").heroes = 41_500_000;
+  assert.equal((await cron()).mine, "999");
+  assert.equal(w.calls.tracker, 2);
+  assert.equal((await call("load", { me: "999" })).body.me.hero, 41_500_000);
+
+  // 조회가 실패하면 6시간 동안 다시 시도하지 않는다.
+  advance(25 * HOUR);
+  w.players.delete("999");
+  assert.match((await cron()).mineError, /찾지 못했습니다/);
+  advance(HOUR);
+  await cron();
+  assert.equal(w.calls.tracker, 3);
+});
+
+test("Tracker가 영웅 총투력을 주지 않으면 공개 랭킹 값을 유지한다", async () => {
+  const { w, call } = await setup();
+  seedServer(w, 247);
+  await call("load", { servers: [247] });
+  advance(HOUR);
+  w.players.get("247000002").heroes = null;
+  const r = await call("refresh", { uid: "247000002" });
+  assert.equal(r.status, 200);
+  assert.match(r.body.message, /이전 값을 유지/);
+  assert.deepEqual({ hero: r.body.player.hero, src: r.body.player.src }, { hero: 99_000_000, src: "rank" });
+});
+
+test("로그인: 10분 안에 10번 틀리면 맞는 비밀번호도 잠시 막힌다", async () => {
+  const { post, sql } = await setup();
+  for (let i = 0; i < 10; i++) assert.equal((await post({ action: "login", password: "wrong" + i })).status, 401);
+  const blocked = await post({ action: "login", password: PASSWORD });
+  assert.equal(blocked.status, 429);
+  assert.match(blocked.body.error, /10분 뒤/);
+  const before = sql("SELECT v FROM meta WHERE k='login_fails'")[0].v;
+  await post({ action: "login", password: "wrong" });
+  assert.equal(sql("SELECT v FROM meta WHERE k='login_fails'")[0].v, before); // 막힌 동안에는 DB에 쓰지 않는다
+  advance(10 * 60_000);
+  assert.equal((await post({ action: "login", password: PASSWORD })).status, 200);
 });
 
 test.after(() => {

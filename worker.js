@@ -21,9 +21,14 @@ const RANK_MANUAL_GAP = 300; // 같은 서버 수동 새로고침 최소 간격
 const RANKS_PER_TICK = 1; // Cron 1회당 랭킹 수집 서버 수 (무료 플랜 CPU 한도 고려)
 const MIN_RANK_ROWS = 10; // 이보다 적게 읽히면 페이지 구조 변경으로 보고 저장하지 않는다
 const GUILD_INTERVAL = 23 * HOUR; // 길드별 전체 투력 수집 주기
-const GUILDS_PER_TICK = 4;
-const AUTO_BUDGET = 320; // 자동 수집이 하루에 쓸 수 있는 Tracker 조회 수
+const GUILDS_PER_TICK = 6;
+const AUTO_BUDGET = 550; // 자동 수집이 하루에 쓸 수 있는 Tracker 조회 수 (랭킹에 오른 길드 약 520곳을 하루 한 번씩)
 const RESERVE = 50; // 오류·예비용으로 남겨 두는 조회 수
+const MINE_INTERVAL = DAY; // 등록된 내 캐릭터가 랭킹 밖일 때 자동 갱신 주기
+const MINE_RETRY = 6 * HOUR;
+const MINE_MAX = 20; // 자동 갱신해 주는 등록 캐릭터 수
+const LOGIN_MAX_FAILS = 10; // LOGIN_WINDOW 안에 이만큼 틀리면 그 시간 동안 로그인을 막는다
+const LOGIN_WINDOW = 600;
 const DEFAULT_LIMIT = 1000;
 const SESSION_DAYS = 30;
 const MAX_LOAD_SERVERS = 8; // 한 번의 요청으로 내려보내는 서버 수
@@ -37,6 +42,7 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS servers(server INTEGER PRIMARY KEY,rank_at INTEGER,rank_try_at INTEGER,rank_count INTEGER,rank_error TEXT)",
   "CREATE TABLE IF NOT EXISTS guilds(server INTEGER NOT NULL,tag TEXT NOT NULL,ranked INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,fetched_at INTEGER,fails INTEGER NOT NULL DEFAULT 0,error TEXT,PRIMARY KEY(server,tag))",
   "CREATE TABLE IF NOT EXISTS quota(day TEXT PRIMARY KEY,lim INTEGER NOT NULL,remaining INTEGER NOT NULL,auto_used INTEGER NOT NULL DEFAULT 0,manual_used INTEGER NOT NULL DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS mine(uid TEXT PRIMARY KEY,at INTEGER NOT NULL,try_at INTEGER)",
 ];
 // 이전 버전이 만든 players 테이블에 없을 수 있는 열. 없으면 추가한다(기존 데이터는 그대로 둔다).
 const PLAYER_COLUMNS = {
@@ -185,10 +191,31 @@ async function checkPassword(env, password) {
   return diff === 0;
 }
 
+// 비밀번호를 연속으로 틀리면 잠시 로그인을 막는다. 막힌 동안에는 DB에 쓰지 않는다(쓰기 한도 보호).
+// 이미 발급된 토큰은 영향받지 않는다.
+async function login(env, password) {
+  await init(env);
+  const t = now();
+  let fails = { n: 0, since: t };
+  try {
+    const saved = JSON.parse((await getMeta(env, "login_fails")) ?? "null");
+    if (saved && Number.isInteger(saved.n) && Number.isInteger(saved.since) && t - saved.since < LOGIN_WINDOW) fails = saved;
+  } catch {}
+  if (fails.n >= LOGIN_MAX_FAILS) {
+    const wait = Math.max(1, Math.ceil((fails.since + LOGIN_WINDOW - t) / 60));
+    return reply({ error: "비밀번호를 여러 번 틀렸습니다. " + wait + "분 뒤에 다시 시도해 주세요." }, 429);
+  }
+  if (!(await checkPassword(env, password))) {
+    await setMeta(env, "login_fails", JSON.stringify({ n: fails.n + 1, since: fails.since }));
+    return reply({ error: "비밀번호가 맞지 않습니다" }, 401);
+  }
+  return reply({ token: await issueToken(env) });
+}
+
 // ---------------------------------------------------------------- Tracker API와 하루 한도
 
 // 조회 전에 한 건을 원자적으로 차감해 둔다. 여러 요청이 동시에 들어와도 보호선을 넘지 않는다.
-//  - auto   : 자동 수집. 하루 AUTO_BUDGET 건까지, 예비(RESERVE)는 남긴다.
+//  - auto   : 자동 수집(길드 전체 투력). 하루 AUTO_BUDGET 건까지, 예비(RESERVE)는 남긴다.
 //  - manual : 사용자 요청. 자동 수집이 아직 쓰지 않은 몫과 예비는 건드리지 않는다.
 async function reserve(env, kind) {
   const d = day();
@@ -196,12 +223,16 @@ async function reserve(env, kind) {
     kind === "auto"
       ? "UPDATE quota SET remaining=remaining-1,auto_used=auto_used+1 WHERE day=?1 AND remaining>?2 AND auto_used<?3 RETURNING remaining"
       : "UPDATE quota SET remaining=remaining-1,manual_used=manual_used+1 WHERE day=?1 AND remaining>?2+MAX(0,?3-auto_used) RETURNING remaining";
-  const [, taken] = await env.DB.batch([
-    env.DB
-      .prepare("INSERT OR IGNORE INTO quota(day,lim,remaining) SELECT ?1,l,l FROM (SELECT COALESCE((SELECT lim FROM quota ORDER BY day DESC LIMIT 1),?2) AS l)")
-      .bind(d, DEFAULT_LIMIT),
-    env.DB.prepare(take).bind(d, RESERVE, AUTO_BUDGET),
-  ]);
+  let taken = await env.DB.prepare(take).bind(d, RESERVE, AUTO_BUDGET).all();
+  if (!taken.results.length) {
+    // 오늘 행이 아직 없을 수 있다. 직전 한도로 만들어 두고 한 번 더 시도한다.
+    [, taken] = await env.DB.batch([
+      env.DB
+        .prepare("INSERT OR IGNORE INTO quota(day,lim,remaining) SELECT ?1,l,l FROM (SELECT COALESCE((SELECT lim FROM quota ORDER BY day DESC LIMIT 1),?2) AS l)")
+        .bind(d, DEFAULT_LIMIT),
+      env.DB.prepare(take).bind(d, RESERVE, AUTO_BUDGET),
+    ]);
+  }
   if (!taken.results.length) {
     throw new AppError(
       kind === "auto" ? "오늘 자동 수집 한도 도달" : "오늘 수동 조회 한도에 도달했습니다 (자동 수집·예비분 보호). 한국 시간 오전 9시에 초기화됩니다.",
@@ -210,13 +241,16 @@ async function reserve(env, kind) {
   }
 }
 
-// Tracker가 알려 준 실제 잔여 횟수로 맞춘다.
-async function syncQuota(env, res, body) {
+// Tracker가 알려 준 실제 잔여 횟수.
+function quotaFrom(res, body) {
   const remaining = num(res.headers.get("X-RateLimit-Remaining")) ?? num(body?.quota?.remaining);
-  if (remaining === null) return;
-  const limit = num(res.headers.get("X-RateLimit-Limit")) ?? num(body?.quota?.limit);
+  if (remaining === null) return null;
+  return { remaining, limit: num(res.headers.get("X-RateLimit-Limit")) ?? num(body?.quota?.limit) };
+}
+
+async function writeQuota(env, q) {
   try {
-    await env.DB.prepare("UPDATE quota SET remaining=?2,lim=COALESCE(?3,lim) WHERE day=?1").bind(day(), remaining, limit).run();
+    await env.DB.prepare("UPDATE quota SET remaining=?2,lim=COALESCE(?3,lim) WHERE day=?1").bind(day(), q.remaining, q.limit).run();
   } catch (err) {
     console.error("quota sync failed", err);
   }
@@ -250,14 +284,17 @@ const TRACKER_ERRORS = {
   429: "오늘 Tracker API 한도를 모두 사용했습니다",
 };
 
-async function tracker(env, path, kind) {
+// hold를 주면 잔여 횟수를 바로 쓰지 않고 hold.quota에 담아 둔다(Cron이 끝에 한 번만 기록).
+async function tracker(env, path, kind, hold) {
   await reserve(env, kind);
   const res = await trackerFetch(env, path);
   let body = null;
   try {
     body = await res.json();
   } catch {}
-  await syncQuota(env, res, body);
+  const q = quotaFrom(res, body);
+  if (q && hold) hold.quota = q;
+  else if (q) await writeQuota(env, q);
   if (!res.ok) {
     const known = TRACKER_ERRORS[res.status];
     throw new AppError(known ?? "Tracker 조회 실패 (HTTP " + res.status + ") · 잠시 후 다시 시도해 주세요", known ? res.status : 502);
@@ -290,8 +327,8 @@ function roster(o) {
 }
 
 // 유저 한 명을 Tracker에서 읽어 저장한다 (API 1회).
-async function refreshPlayer(env, path, expectServer) {
-  const body = await tracker(env, "players/" + path + "?fresh=1", "manual");
+async function refreshPlayer(env, path, expectServer, hold) {
+  const body = await tracker(env, "players/" + path + "?fresh=1", "manual", hold);
   const p = pickPlayer(body);
   const uid = String(p?.uid ?? p?.player_id ?? "");
   const nick = String(p?.nick_name ?? p?.nick ?? p?.name ?? "").trim();
@@ -308,8 +345,8 @@ async function refreshPlayer(env, path, expectServer) {
 }
 
 // 길드 한 곳의 전체 투력을 읽어 반영한다 (API 1회, 자동 수집 몫에서 차감).
-async function collectGuild(env, server, tag) {
-  const body = await tracker(env, "alliances/" + server + "/" + encodeURIComponent(tag) + "?fresh=1", "auto");
+async function collectGuild(env, server, tag, hold) {
+  const body = await tracker(env, "alliances/" + server + "/" + encodeURIComponent(tag) + "?fresh=1", "auto", hold);
   const members = roster(body);
   if (!members || !members.length) throw new AppError("길드원 정보 없음", 502);
   const rows = [];
@@ -511,6 +548,11 @@ async function actionRegister(env, b) {
     row = await playerByUid(env, uid);
     viaTracker = true;
   }
+  // 랭킹 밖으로 밀려나도 Cron이 하루 한 번 갱신해 주도록 기억해 둔다.
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO mine(uid,at) VALUES(?1,?2) ON CONFLICT(uid) DO UPDATE SET at=excluded.at").bind(row.uid, now()),
+    env.DB.prepare("DELETE FROM mine WHERE uid NOT IN (SELECT uid FROM mine ORDER BY at DESC LIMIT ?1)").bind(MINE_MAX),
+  ]);
   return { me: row, message: viaTracker ? "내 캐릭터 등록 완료 · Tracker 조회 1회 사용" : "내 캐릭터 등록 완료 · 공개 랭킹에서 확인 (API 차감 없음)" };
 }
 
@@ -548,6 +590,7 @@ const ACTIONS = { load: actionLoad, register: actionRegister, refresh: actionRef
 
 async function runCron(env) {
   const report = { at: now(), ranks: [], guildsOk: 0, guildsFail: 0 };
+  const hold = {};
   try {
     await init(env);
     const t = now();
@@ -578,7 +621,7 @@ async function runCron(env) {
     ).results;
     for (const g of dueGuilds) {
       try {
-        await collectGuild(env, g.server, g.tag);
+        await collectGuild(env, g.server, g.tag, hold);
         await env.DB
           .prepare("UPDATE guilds SET fetched_at=?3,next_at=?4,fails=0,error=NULL WHERE server=?1 AND tag=?2")
           .bind(g.server, g.tag, now(), now() + GUILD_INTERVAL)
@@ -599,9 +642,31 @@ async function runCron(env) {
       }
     }
 
-    await env.DB.prepare("DELETE FROM quota WHERE day<?").bind(new Date(Date.now() - 14 * DAY * 1000).toISOString().slice(0, 10)).run();
+    // 3) 등록된 내 캐릭터: 공개 랭킹에 있으면 1)에서 이미 갱신된다. 랭킹 밖일 때만 하루 한 번 Tracker로 읽는다.
+    const mine = await env.DB
+      .prepare(
+        "SELECT m.uid FROM mine m LEFT JOIN players p ON p.uid=m.uid LEFT JOIN wiki_ranks w ON w.uid=m.uid " +
+          "WHERE w.uid IS NULL AND (p.hero_at IS NULL OR p.hero_at<=?1) AND (m.try_at IS NULL OR m.try_at<=?2) ORDER BY p.hero_at LIMIT 1",
+      )
+      .bind(t - MINE_INTERVAL, t - MINE_RETRY)
+      .first();
+    if (mine) {
+      await env.DB.prepare("UPDATE mine SET try_at=?2 WHERE uid=?1").bind(mine.uid, t).run();
+      try {
+        await refreshPlayer(env, mine.uid, null, hold);
+        report.mine = mine.uid;
+      } catch (err) {
+        report.mineError = err.message;
+      }
+    }
+
+    if (hold.quota) await writeQuota(env, hold.quota);
+    if (new Date(t * 1000).getUTCMinutes() < 15) {
+      await env.DB.prepare("DELETE FROM quota WHERE day<?").bind(new Date((t - 14 * DAY) * 1000).toISOString().slice(0, 10)).run();
+    }
   } catch (err) {
     report.error = String(err?.message ?? err);
+    if (hold.quota) await writeQuota(env, hold.quota);
   }
   console.log("cron", JSON.stringify(report));
   try {
@@ -643,8 +708,12 @@ export default {
     if (missing.length) return reply({ error: "서버 설정 누락: " + missing.join(", ") }, 500);
 
     if (b.action === "login") {
-      if (!(await checkPassword(env, b.password))) return reply({ error: "비밀번호가 맞지 않습니다" }, 401);
-      return reply({ token: await issueToken(env) });
+      try {
+        return await login(env, b.password);
+      } catch (err) {
+        console.error("login failed", err);
+        return reply({ error: "DB 처리 실패: " + String(err?.message ?? err) }, 500);
+      }
     }
     if (!(await checkToken(env, b.token))) return reply({ error: "로그인이 필요합니다" }, 401);
 
